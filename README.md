@@ -1,2 +1,1 @@
-# dentist
-C++ assignment
+# dentist-appointment-system-assignment

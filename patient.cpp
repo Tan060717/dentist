@@ -1,0 +1,649 @@
+#include "../headers/Patient.h"
+#include "../headers/Appointment.h"
+#include "../headers/Payment.h"
+#include "../headers/Loyalty.h"
+#include "../headers/Console.h"
+#include "../headers/Validation.h"
+#include "../src/validation.cpp"
+#include "../headers/Verification.h"
+#include "../src/verification.cpp"
+#include "../src/users.cpp"
+#include <iostream>
+#include <ostream>
+#include <vector>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <cstdlib>
+
+using namespace std;
+
+static string trimInput(const string& text) {
+    size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == string::npos) return "";
+    size_t last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+static string nextPatientId(const vector<Patient>& patients) {
+    int highest = 0;
+    for (size_t i = 0; i < patients.size(); i++) {
+        const string& id = patients[i].user.id;
+        if (id.length() < 2 || toupper(id[0]) != 'P') continue;
+        int number = atoi(id.substr(1).c_str());
+        if (number > highest) highest = number;
+    }
+    stringstream ss;
+    ss << "P" << setw(3) << setfill('0') << (highest + 1);
+    return ss.str();
+}
+
+static void printPatientMenu(const Session& current) {
+    clearScreen();
+    cout << "\nWelcome, " << current.name << "!" << endl;
+    cout << "1. Schedule an appointment" << endl;
+    cout << "2. View my appointments" << endl;
+    cout << "3. Modify an appointment" << endl;
+    cout << "4. Cancel an appointment" << endl;
+    cout << "5. Find the next available slot" << endl;
+    cout << "6. View profile" << endl;
+    cout << "7. Pay an invoice" << endl;
+    cout << "8. My loyalty tickets" << endl;
+    cout << "0. Logout" << endl;
+}
+
+void mainMenu(vector<Patient>& patients, const Session& current) {
+    checkAndShowLoyaltyNotifications(current); // shown once per login, before the menu loop starts
+
+    string line, note;
+    bool showMenu = true;
+
+    while (true) {
+        if (showMenu) {
+            printPatientMenu(current);
+            showMenu = false;
+        }
+
+        clearLine();
+        cout << note << "Choice: " << flush;
+        getline(cin, line);
+        stayOnPromptLine();
+
+        if (!cin) { cout << "\nLogging out." << endl; return; }
+
+        int input = -1;
+        stringstream ss(line);
+        if (!(ss >> input) || input < 0 || input > 8) {
+            note = "[invalid input, try again] ";
+            continue;
+        }
+
+        clearLine();
+        cout << "Choice: " << input << endl;
+        note.clear();
+
+        if (input == 0) {
+            cout << "Logging out." << endl;
+            return;
+        }
+
+        switch (input) {
+            case 1: scheduleAppointment(current); break;
+            case 2: viewAppointments(current);    break;
+            case 3: modifyAppointment(current);   break;
+            case 4: cancelAppointment(current);   break;
+            case 5: findNextAvailable();          break;
+            case 6:
+                if (viewPatientProfile(patients, currentUserID)) {
+                    cout << "Logging out." << endl;
+                    return;
+                }
+                pauseForKey();
+                break;
+            case 7: payForAppointment(current);      break;
+            case 8: viewMyLoyaltyTickets(current);   break;
+        }
+        showMenu = true;
+    }
+}
+
+static string askField(const string& label, const string& failMsg, bool (*isValid)(string)) {
+    string note, answer;
+    while (true) {
+        answer = trimInput(askInPlace(label, note));
+        if (!cin) return answer;
+
+        if (answer.empty()) {
+            note = "[cannot be blank] ";
+        } else if (!isValid(answer)) {
+            note = failMsg;
+        } else {
+            acceptInPlace(label, answer);
+            return answer;
+        }
+    }
+}
+
+static int askAge(const string& label) {
+    string note;
+    while (true) {
+        string line = trimInput(askInPlace(label, note));
+        if (!cin) return 0;
+
+        int value = 0;
+        stringstream parse(line);
+        if ((parse >> value) && validatePatientAge(value)) {
+            stringstream shown;
+            shown << value;
+            acceptInPlace(label, shown.str());
+            return value;
+        }
+        note = "[18-120] ";
+    }
+}
+
+static char askGender(const string& label) {
+    string note;
+    while (true) {
+        string line = trimInput(askInPlace(label, note));
+        if (!cin) return 'M';
+
+        if (line.length() == 1 && validateGender(line[0])) {
+            char typed = toupper(line[0]);
+            acceptInPlace(label, string(1, typed));
+            return typed;
+        }
+        note = "[M or F] ";
+    }
+}
+
+static char askLetter(const string& label, const string& allowed, const string& failMsg) {
+    string note;
+    while (true) {
+        string line = trimInput(askInPlace(label, note));
+        if (!cin) {
+
+            size_t no = allowed.find('N');
+            return (no == string::npos) ? allowed[0] : 'N';
+        }
+
+        if (line.length() == 1) {
+            char typed = toupper(line[0]);
+            if (allowed.find(typed) != string::npos) {
+                acceptInPlace(label, string(1, typed));
+                return typed;
+            }
+        }
+        note = failMsg;
+    }
+}
+
+static bool confirmProfilePassword(const string& actualPassword) {
+    string note;
+    const int MAX_TRIES = 3;
+
+    for (int attempt = 1; attempt <= MAX_TRIES; attempt++) {
+        string entered = askInPlace("Enter password: ", note);
+        if (!cin) return false;
+        if (entered == actualPassword) return true;
+        note = "[incorrect] ";
+    }
+    cout << "[!] Too many failed attempts.\n";
+    return false;
+}
+
+Patient inputPatientDetails(string id, vector<Patient>& patients) {
+    clearScreen();
+    Patient p;
+    p.user.id = id;
+
+    // name with 0 = go back, befitting Console-style prompts
+    string nameNote;
+    while (true) {
+        string typed = trimInput(askInPlace("Name: ", nameNote));
+        if (!cin) return p;
+
+        if (typed == "0") { p.user.name = "0"; return p; }
+        if (typed.empty()) { nameNote = "[cannot be blank] "; continue; }
+        if (validateName(typed)) {
+            p.user.name = typed;
+            acceptInPlace("Name: ", typed);
+            break;
+        }
+        nameNote = "[letters/spaces only] ";
+    }
+
+    p.user.age = askAge("Age (18-120): ");
+    p.user.gender = askGender("Gender (M/F): ");
+
+    string nricNote;
+    while (true) {
+        string typed = trimInput(askInPlace("NRIC (e.g. 000000-00-0000): ", nricNote));
+        if (!cin) { p.user.nric = typed; break; }
+
+        if (typed.empty()) { nricNote = "[cannot be blank] "; continue; }
+
+        p.user.nric = typed;
+        if (!validateNRIC(p.user.nric, patients)) {
+            p.user.nric.clear();
+            nricNote = "[use 000000-00-0000, and not already registered] ";
+            continue;
+        }
+        acceptInPlace("NRIC (e.g. 000000-00-0000): ", typed);
+        break;
+    }
+
+    string emailNote;
+    while (true) {
+        string typed = trimInput(askInPlace("Email (e.g. name@example.com): ", emailNote));
+        if (!cin) { p.user.email = typed; break; }
+
+        if (typed.empty()) { emailNote = "[cannot be blank] "; continue; }
+
+        p.user.email = typed;
+        if (!validateEmail(p, patients)) {
+            p.user.email.clear();
+            emailNote = "[use name@example.com, and not already registered] ";
+            continue;
+        }
+        acceptInPlace("Email (e.g. name@example.com): ", typed);
+        break;
+    }
+
+    p.user.password = askField("Password: ", "[cannot be blank] ", validatePassword);
+    p.user.phoneNo = askField("Phone Number (e.g. 012-345 6789): ", "[use 01x-xxx xxxx] ", validatePhoneNo);
+
+    p.allergies = trimInput(askInPlace("Allergies (or 'none'): ", ""));
+    if (p.allergies.empty()) p.allergies = "none";
+    acceptInPlace("Allergies (or 'none'): ", p.allergies);
+
+    // added: capture insurance status so Payment module can auto-apply the discount
+    char insuranceAns;
+    cout << "Do you have dental insurance coverage? (Y/N): ";
+    cin >> insuranceAns;
+    cin.ignore();
+    p.hasInsurance = (toupper(insuranceAns) == 'Y');
+
+    return p;
+}
+
+void createPatient(Patient patient, vector<Patient>& patients) {
+    patients.push_back(patient);
+    savePatients(patients);
+}
+
+void registerPatient(vector<Patient>& patients) {
+    clearScreen();
+    cout << "\nNew patient registration. (0 at Name to go back)" << endl;
+
+    Patient p = inputPatientDetails(nextPatientId(patients), patients);
+
+    if (trimInput(p.user.name) == "0") {
+        cout << "Registration cancelled." << endl;
+        return;
+    }
+
+    while (true) {
+        cout << "\nYour Profile (Patient ID: " << p.user.id << ")" << endl;
+        cout << "Name: "      << p.user.name    << endl;
+        cout << "Age: "       << p.user.age     << endl;
+        cout << "Gender: "    << p.user.gender  << endl;
+        cout << "NRIC: "      << p.user.nric    << endl;
+        cout << "Email: "     << p.user.email   << endl;
+        cout << "Phone No.: " << p.user.phoneNo << endl;
+        cout << "Allergies: " << p.allergies    << endl;
+        cout << "Insurance: " << (p.hasInsurance ? "Yes" : "No") << endl;
+
+        char answer = askLetter("Confirm registration? (Y = Yes / N = No / M = Modify): ",
+                                "YNM", "[Y, N or M] ");
+
+        if (answer == 'Y') {
+            createPatient(p, patients);
+            cout << "\nRegistered. Your patient ID is " << p.user.id
+                << " - log in with your ID and password." << endl;
+            return;
+        }
+        if (answer == 'N') {
+            cout << "\nRegistration discarded. Nothing was saved." << endl;
+            return;
+        }
+
+        cout << "\nModify your pending profile." << endl;
+        modifyPatient(patients, p);
+    }
+}
+
+void loginPatient(vector<Patient>& patients) {
+    clearScreen();
+
+    string id, password;
+
+    cout << "Please login. (0 to go back)" << endl;
+
+    string note;
+    while (true) {
+        clearLine();
+        cout << note << "ID: " << flush;
+        getline(cin, id);
+        stayOnPromptLine();
+
+        if (trimInput(id) == "0" || !cin) {
+            clearLine();
+            cout << "Login cancelled." << endl;
+            return;
+        }
+
+        if (trimInput(id).empty()) { note = "[cannot be blank] "; continue; }
+        if (verifyID(patients, id)) break;
+        note = "[no account with that ID] ";
+    }
+    clearLine();
+    cout << "ID: " << id << endl;
+
+    note.clear();
+    while (true) {
+        clearLine();
+        cout << note << "Password: " << flush;
+        getline(cin, password);
+        stayOnPromptLine();
+
+        if (trimInput(password) == "0" || !cin) {
+            clearLine();
+            cout << "Login cancelled." << endl;
+            return;
+        }
+
+        if (password.empty()) { note = "[cannot be blank] "; continue; }
+
+        Patient* account = findPatientByID(patients, id);
+        if (account != nullptr && password == account->user.password) break;
+        note = "[incorrect password] ";
+    }
+    clearLine();
+    cout << "Password: " << string(password.length(), '*') << endl;
+
+    assignCurrentUser(patients, id);
+
+    Session current;
+    current.role = PATIENT;
+    for (const Patient& p : patients) {
+        if (p.user.id == id) {
+            current.userId   = p.user.id;
+            current.name     = p.user.name;
+            current.password = p.user.password;
+            break;
+        }
+    }
+
+    current.name = getUsername(patients, id);
+
+    mainMenu(patients, current);
+}
+
+vector<Patient> loadPatients() {
+    ifstream inFile("data/patients.txt");
+
+    vector<Patient> p;
+
+    if (!inFile.is_open()) return p;
+
+    string id, name, nric, email, password, phoneNo, allergies;
+    int age;
+    char gender;
+
+    string line;
+
+    while(getline(inFile, line)) {
+        stringstream ss(line);
+
+        string ageStr, genderStr, insuranceStr;
+        getline(ss, id, ';');
+        getline(ss, name, ';');
+        getline(ss, ageStr, ';');    age = toIntOr(ageStr, 0);
+        getline(ss, genderStr, ';'); gender = genderStr.empty() ? '?' : genderStr[0];
+        getline(ss, nric, ';');
+        getline(ss, email, ';');
+        getline(ss, password, ';');
+        getline(ss, phoneNo, ';');
+        getline(ss, allergies, ';');
+        getline(ss, insuranceStr); // added: last field, no trailing delimiter
+
+        if (trimInput(id).empty()) continue;
+        if (trimInput(email).empty()) continue;
+
+        Patient patient;
+        patient.user.id = id;
+        patient.user.name = name;
+        patient.user.age = age;
+        patient.user.gender = gender;
+        patient.user.nric = nric;
+        patient.user.email = email;
+        patient.user.password = password;
+        patient.user.phoneNo = phoneNo;
+        patient.allergies = allergies;
+        patient.hasInsurance = (!insuranceStr.empty() && insuranceStr[0] == '1'); // added
+
+        p.push_back(patient);
+    }
+
+    inFile.close();
+
+    return p;
+}
+
+void savePatients(vector<Patient> patients) {
+    filesystem::create_directories("data");
+
+    ofstream outFile("data/patients.txt");
+
+    for (Patient patient : patients) {
+        outFile << patient.user.id << ";" << patient.user.name << ";" << patient.user.age << ";" << patient.user.gender << ";" << patient.user.nric << ";" << patient.user.email << ";" << patient.user.password << ";" << patient.user.phoneNo << ";" << patient.allergies << ";" << (patient.hasInsurance ? "1" : "0") << endl;
+    }
+
+    outFile.close();
+}
+
+bool viewPatientProfile(vector<Patient>& patients, string currentUserID) {
+    Patient* target = findPatientByID(patients, currentUserID);
+    if (target == nullptr) return false;
+
+    clearScreen();
+    cout << "\nYour Profile:" << endl;
+    cout << "Patient ID: " << target->user.id << endl;
+    cout << "Name: " << target->user.name << endl;
+    cout << "Age: " << target->user.age << endl;
+    char g = toupper(target->user.gender);
+    cout << "Gender: " << (g == 'M' ? "Male" : g == 'F' ? "Female" : "Not recorded") << endl;
+    cout << "Email: " << target->user.email << endl;
+    cout << "NRIC: " << target->user.nric << endl;
+    cout << "Contact: " << target->user.phoneNo << endl;
+    cout << "Insurance: " << (target->hasInsurance ? "Yes" : "No") << endl;
+
+    cout << "\nOptions: M = Modify, D = Delete, Q = Quit" << endl;
+
+    string input = askInPlace("Choice: ", "");
+
+    if (!input.empty() && toupper(input[0]) == 'M') modifyPatient(patients, *target);
+    if (!input.empty() && toupper(input[0]) == 'D') {
+        if (deletePatient(patients, *target)) return true;
+    }
+    return false;
+}
+
+void modifyPatient(vector<Patient>& patients, Patient& patient) {
+    clearScreen();
+    int index = 0;
+    string input;
+
+    do {
+        cout << "\nChoose a field to change." << endl;
+        cout << "Your Profile:" << endl;
+        cout << "1. Name   : " << patient.user.name << endl;
+        cout << "2. Age    : " << patient.user.age << endl;
+        cout << "3. Email  : " << patient.user.email << endl;
+        cout << "4. Contact: " << patient.user.phoneNo << endl;
+        cout << "0. Done" << endl;
+
+        index = readMenuChoice("Choice: ", 0, 4);
+
+        switch (index) {
+            case 1: {
+                cout << "Change your name: ";
+                getline(cin, input);
+                if (!cin) return;
+
+                if (confirmProfilePassword(patient.user.password)) {
+                    patient.user.name = input;
+                    cout << "Saved." << endl;
+                } else {
+                    cout << "Change discarded." << endl;
+                }
+                break;
+            }
+
+            case 2: {
+                int newAge = askAge("Change your age (18-120): ");
+                if (!cin) return;
+
+                if (confirmProfilePassword(patient.user.password)) {
+                    patient.user.age = newAge;
+                    cout << "Saved." << endl;
+                } else {
+                    cout << "Change discarded." << endl;
+                }
+                break;
+            }
+
+            case 3: {
+                for (;;) {
+                    cout << "Change your email: ";
+                    getline(cin, input);
+                    if (!cin) return;
+
+                    if (input.empty()) { cout << "[cannot be blank] "; continue; }
+
+                    // validated on a throwaway copy, not on `patient` itself - patient is
+                    // often a live reference into `patients`, so validating in place would
+                    // make the uniqueness check compare the candidate email against itself
+                    // and always report it as already registered
+                    Patient probe = patient;
+                    probe.user.email = input;
+                    if (!validateEmail(probe, patients)) {
+                        cout << "[use name@example.com, and not already registered] ";
+                        continue;
+                    }
+                    break;
+                }
+
+                if (confirmProfilePassword(patient.user.password)) {
+                    patient.user.email = input;
+                    cout << "Saved." << endl;
+                } else {
+                    cout << "Change discarded." << endl;
+                }
+                break;
+            }
+
+            case 4: {
+                cout << "Change your contact: ";
+                getline(cin, input);
+                if (!cin) return;
+
+                while (!validatePhoneNo(input)) {
+                    cout << "Invalid phone (01x-xxx xxxx). Try again: ";
+                    getline(cin, input);
+                    if (!cin) return;
+                }
+
+                if (confirmProfilePassword(patient.user.password)) {
+                    patient.user.phoneNo = input;
+                    cout << "Saved." << endl;
+                } else {
+                    cout << "Change discarded." << endl;
+                }
+                break;
+            }
+
+            case 0:
+                savePatients(patients);
+                break;
+
+            default:
+                cout << "Invalid input." << endl;
+                break;
+        }
+    } while (index != 0);
+}
+
+bool deletePatient(vector<Patient>& patients, Patient& patient) {
+    clearScreen();
+    cout << "\nDelete Patient Profile" << endl;
+    cout << "Patient ID: " << patient.user.id << endl;
+    cout << "Name: " << patient.user.name << endl;
+    cout << "Email: " << patient.user.email << endl;
+
+    char confirm = askLetter("\nAre you sure you want to delete this profile? (Y/N): ",
+                             "YN", "[Y or N] ");
+    if (confirm == 'N') {
+        cout << "Deletion cancelled." << endl;
+        return false;
+    }
+
+    string password;
+    int attempts = 0;
+    while (attempts < 3) {
+        cout << "Enter password to confirm (" << (3 - attempts) << " attempt(s) left): ";
+        getline(cin, password);
+
+        if (password == patient.user.password) {
+            for (int i = 0; i < patients.size(); i++) {
+                if (patients.at(i).user.id == patient.user.id) {
+                    patients.erase(patients.begin() + i);
+                    break;
+                }
+            }
+            savePatients(patients);
+            cout << "Profile deleted." << endl;
+            return true;
+        }
+
+        attempts++;
+        if (attempts < 3) {
+            cout << "[incorrect password] " << endl;
+        }
+    }
+
+    cout << "\nToo many incorrect attempts. Returning to main menu." << endl;
+    return false;
+}
+// added: lookup helper so the Payment module can pull a patient's age/insurance
+// status directly by ID instead of asking the receptionist to re-enter it
+Patient* findPatientByID(vector<Patient>& patients, const string& id) {
+    for (Patient& patient : patients) {
+        if (patient.user.id == id) {
+            return &patient;
+        }
+    }
+    return nullptr;
+}
+
+void viewPatients(vector<Patient>& patients) {
+    if (patients.empty()) {
+        cout << "\nNo patients are registered yet.\n";
+        return;
+    }
+
+    cout << "\n  " << left << setw(8) << "ID" << setw(24) << "Name"
+        << setw(28) << "Email" << "Age\n";
+    cout << "  " << string(64, '-') << "\n";
+    for (size_t i = 0; i < patients.size(); i++) {
+        const Patient& p = patients[i];
+        cout << "  " << left << setw(8) << p.user.id
+            << setw(24) << (p.user.name.empty() ? "(no name on record)" : p.user.name)
+            << setw(28) << p.user.email << p.user.age << "\n";
+    }
+    cout << "  " << string(64, '-') << "\n";
+    cout << "  " << patients.size() << " patient(s).\n";
+    pauseForKey();
+}

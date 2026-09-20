@@ -1,0 +1,4 @@
+P001;Sun Ting Wong;23;M;052342-12-2342;suntingwong@gmail.com;Stw123;017-230 2342;water;0
+P002;Lim Ah Kau;10;M;052342-12-2342;limahkau@gmail.com;ball;017-235 2342;water;0
+P003;Henry;33;F;012323-12-3231;henry@gmail.com;henry;012-231 1232;none;1
+P004;Uncle R;69;M;123456-67-1234;uncler@yahoo.com;sahur;011-011 1010;egg;0
